@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Roundcube upgrader for Alma 9 + iRedMail
+# Roundcube upgrader for AlmaLinux 9 + iRedMail
 # Safe across mixed 1.6.6/1.6.7/1.6.8 -> 1.6.11
 # - Detects Roundcube path
 # - Reads DB DSN from config.inc.php
 # - Backs up code & DB
-# - Downloads 1.6.11 from your GitHub mirror
+# - Downloads 1.6.11 from your GitHub mirror (checksum pinned)
 # - Runs bin/installto.sh (handles schema hops)
 # - Ensures cache/temp exist
 # - Restarts php-fpm + reloads nginx
@@ -17,6 +17,11 @@ set -euo pipefail
 #   RC_PATH=/path VERSION=1.6.11 SRC_URL=https://... SHA256_EXPECTED=<hex> bash upgrade_roundcube.sh
 # or:
 #   bash upgrade_roundcube.sh --rc-path /path --version 1.6.11 --src-url https://... --sha256 <hex>
+#
+# Debug:
+#   DEBUG=1 bash upgrade_roundcube.sh
+
+[[ "${DEBUG:-0}" = "1" ]] && set -x
 
 VERSION_DEFAULT="1.6.11"
 SRC_URL_DEFAULT="https://raw.githubusercontent.com/alphagg/mailinstaller/main/roundcubemail-1.6.11-complete.tar.gz"
@@ -47,7 +52,7 @@ Defaults:
   --version   ${VERSION_DEFAULT}
   --src-url   ${SRC_URL_DEFAULT}
   --sha256    ${SHA256_DEFAULT}
-To disable checksum verification, set: SHA256_EXPECTED=""
+To disable checksum verification: SHA256_EXPECTED=""
 EOF
       exit 0 ;;
     *) die "Unknown argument: $1" ;;
@@ -69,12 +74,14 @@ log "Roundcube path: $RC_PATH"
 # --- Detect current RC version (composer.json then Roundcube.php) ---
 detect_version() {
   local path="$1" v=""
+  set +e
   if [[ -f "$path/composer.json" ]]; then
-    v="$(php -r 'echo (json_decode(file_get_contents(getenv("F")), true)["version"] ?? "");' 2>/dev/null F="$path/composer.json")" || true
+    v="$(php -r 'echo (json_decode(file_get_contents(getenv("F")), true)["version"] ?? "");' 2>/dev/null F="$path/composer.json")"
   fi
   if [[ -z "$v" && -f "$path/program/lib/Roundcube.php" ]]; then
-    v="$(php -r '$s=@file_get_contents(getenv("F")); if(preg_match('/const VERSION\\s*=\\s*\\"([0-9.]+)\\"/',$s,$m)) echo $m[1];' 2>/dev/null F="$path/program/lib/Roundcube.php")" || true
+    v="$(php -r '$s=@file_get_contents(getenv("F")); if(preg_match('/const VERSION\\s*=\\s*\\"([0-9.]+)\\"/',$s,$m)) echo $m[1];' 2>/dev/null F="$path/program/lib/Roundcube.php")"
   fi
+  set -e
   echo "$v"
 }
 
@@ -105,6 +112,7 @@ done
 DB_DSN=$(php -r "include '${CONFIG_FILE}'; echo isset(\$config['db_dsnw']) ? \$config['db_dsnw'] : '';" 2>/dev/null || true)
 [[ -n "$DB_DSN" ]] || die "Cannot read \$config['db_dsnw'] from ${CONFIG_FILE}."
 
+# Parse DSN safely
 read -r DB_DRIVER DB_USER DB_PASS DB_HOST DB_NAME < <(DB_DSN="${DB_DSN}" php -r '
   $u = parse_url(getenv("DB_DSN"));
   $driver = $u["scheme"] ?? "mysql";
@@ -117,12 +125,13 @@ read -r DB_DRIVER DB_USER DB_PASS DB_HOST DB_NAME < <(DB_DSN="${DB_DSN}" php -r 
 [[ "$DB_DRIVER" == "mysql" || "$DB_DRIVER" == "mysqli" ]] || die "Unsupported DB driver: $DB_DRIVER"
 log "DB: ${DB_NAME} on ${DB_HOST} (user: ${DB_USER})"
 
-# --- Tools & services ---
+# --- Tools check ---
 for b in mysqldump mysql tar php curl systemctl; do command -v "$b" >/dev/null || die "$b not found."; done
 
+# --- Service names (avoid fragile pipes) ---
 PHPFPM_SVC=""
 for s in php-fpm php-fpm80 php-fpm81 php-fpm82; do
-  systemctl list-unit-files | grep -q "^${s}.service" && PHPFPM_SVC="$s" && break
+  if systemctl status "$s" >/dev/null 2>&1; then PHPFPM_SVC="$s"; break; fi
 done
 [[ -n "$PHPFPM_SVC" ]] || PHPFPM_SVC="php-fpm"
 NGINX_SVC="nginx"
@@ -147,8 +156,11 @@ log "Backing up DB to ${DB_BKP}"
 if [[ -n "${DB_PASS}" ]]; then
   mysqldump -h "${DB_HOST}" -u "${DB_USER}" -p"${DB_PASS}" --single-transaction --quick --routines --triggers "${DB_NAME}" > "${DB_BKP}"
 else
-  [[ -f /root/.my.cnf ]] || die "No DB password and /root/.my.cnf not present."
-  mysqldump -h "${DB_HOST}" -u "${DB_USER}" --single-transaction --quick --routines --triggers "${DB_NAME}" > "${DB_BKP}"
+  if [[ -f /root/.my.cnf ]]; then
+    mysqldump -h "${DB_HOST}" -u "${DB_USER}" --single-transaction --quick --routines --triggers "${DB_NAME}" > "${DB_BKP}"
+  else
+    die "No DB password available and /root/.my.cnf not present."
+  fi
 fi
 
 # --- Download tarball ---
@@ -170,7 +182,7 @@ NEW_DIR="$(find "${EXTRACT_DIR}" -maxdepth 1 -type d -name "roundcubemail-*")"
 
 log "Running installto.sh"
 pushd "${NEW_DIR}" >/dev/null
-bin/installto.sh "${RC_PATH}"
+bash bin/installto.sh "${RC_PATH}"
 popd >/dev/null
 
 # --- Clear cache & restart ---
